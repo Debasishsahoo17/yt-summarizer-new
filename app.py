@@ -1,5 +1,5 @@
 from flask import Flask, request, jsonify, render_template
-from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
+from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound, YouTubeRequestFailed
 from sklearn.feature_extraction.text import TfidfVectorizer
 from nltk.tokenize import sent_tokenize
 import nltk
@@ -7,6 +7,7 @@ import numpy as np
 from urllib.parse import urlparse, parse_qs
 import random
 import yt_dlp
+import time
 
 nltk.download('punkt')
 
@@ -26,40 +27,50 @@ def get_transcript(video_url):
     if not video_id:
         return "Invalid YouTube URL", None
 
-    try:
-        transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=['en'])
-        text = " ".join([t['text'] for t in transcript])
-        if is_song_lyrics(text):
-            return "This appears to be a song. Summarization is not supported for music videos.", None
-        return text, "transcript"
-    except (NoTranscriptFound, TranscriptsDisabled):
-        return get_video_metadata(video_url), "metadata"
+    retries = 3
+    for attempt in range(retries):
+        try:
+            transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=['en'])
+            text = " ".join([t['text'] for t in transcript])
+            if is_song_lyrics(text):
+                return "This appears to be a song. Summarization is not supported for music videos.", None
+            return text, "transcript"
+        except YouTubeRequestFailed as e:
+            if "429" in str(e) and attempt < retries - 1:
+                time.sleep(2 ** attempt)  # Exponential backoff: 1s, 2s, 4s
+                continue
+            return f"Failed to retrieve transcript after {retries} attempts: {str(e)}", None
+        except (NoTranscriptFound, TranscriptsDisabled):
+            return get_video_metadata(video_url), "metadata"
 
 def get_video_metadata(video_url):
     ydl_opts = {'quiet': True, 'no_warnings': True}
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(video_url, download=False)
-            title = info.get('title', '')
-            description = info.get('description', '')
-            tags = ' '.join(info.get('tags', [])) if info.get('tags') else ''
+            title = info.get('title', 'No title available')
+            description = info.get('description', 'No description available')
+            tags = ' '.join(info.get('tags', [])) if info.get('tags') else 'No tags available'
             metadata_text = f"{title}. {description} {tags}"
-            return metadata_text if metadata_text.strip() else "No metadata available."
+            return metadata_text.strip(), "metadata"
     except Exception as e:
-        return f"Could not fetch metadata: {str(e)}"
+        return f"Could not fetch metadata: {str(e)}", "metadata"
 
 def is_song_lyrics(text):
     lines = text.split("\n")
     if any("♪" in line for line in lines):
         return True
     unique_lines = set(lines)
-    if len(unique_lines) / len(lines) < 0.6:
+    if len(lines) > 0 and len(unique_lines) / len(lines) < 0.6:  # Avoid division by zero
         return True
     return False
 
 def summarize_text(text, num_sentences=5, source="transcript"):
     """Generates concise, meaningful bullet points using TF-IDF."""
     sentences = sent_tokenize(text)
+    
+    if not sentences:  # Handle empty text case
+        return "No content available to summarize.", 100
     
     if len(sentences) < num_sentences:
         bullet_points = [f"- {sentence.strip()}" for sentence in sentences]
@@ -97,13 +108,16 @@ def summarize_text(text, num_sentences=5, source="transcript"):
 
 @app.route("/transcript", methods=["POST"])
 def transcript_api():
-    data = request.json
+    data = request.get_json()  # More robust than request.json
+    if not data or "url" not in data:
+        return jsonify({"error": "No URL provided"}), 400
+
     text, source = get_transcript(data["url"])
     
-    if "Invalid YouTube URL" in text or "This appears to be a song" in text:
-        return jsonify({"error": text})
-    if "No metadata available" in text or "Could not fetch metadata" in text:
-        return jsonify({"error": text})
+    if "Invalid YouTube URL" in text or "This appears to be a song" in text or "Failed to retrieve transcript" in text:
+        return jsonify({"error": text}), 400
+    if "Could not fetch metadata" in text:
+        return jsonify({"error": text}), 400
 
     summary, accuracy = summarize_text(text, num_sentences=5, source=source)
     return jsonify({
@@ -113,4 +127,4 @@ def transcript_api():
     })
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    app.run(host="0.0.0.0", port=5000, debug=True)  # Added debug=True for development
